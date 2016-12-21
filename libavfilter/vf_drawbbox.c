@@ -25,6 +25,14 @@
  * that needs to write in the input frame.
  */
 
+#include "config.h"
+#if HAVE_OPENCV2_CORE_CORE_C_H
+#include <opencv2/core/core_c.h>
+#include <opencv2/imgproc/imgproc_c.h>
+#else
+#include <opencv/cv.h>
+#include <opencv/cxcore.h>
+#endif
 #include "libavutil/colorspace.h"
 #include "libavutil/common.h"
 #include "libavutil/opt.h"
@@ -64,7 +72,6 @@ enum var_name {
 
 typedef struct DrawBBoxContext {
     const AVClass *class;
-    int x, y, w, h;
     int thickness;
     char *color_str;
     unsigned char yuv_color[4];
@@ -80,6 +87,8 @@ typedef struct DrawBBoxContext {
 } DrawBBoxContext;
 
 static const int NUM_EXPR_EVALS = 5;
+
+static CvFont font;
 
 static av_cold int init(AVFilterContext *ctx)
 {
@@ -163,6 +172,8 @@ static av_cold int init(AVFilterContext *ctx)
         }
     }
 
+    cvInitFont(&font, CV_FONT_HERSHEY_SIMPLEX, 0.5, 0.5, 0, 1, 8);
+
     return 0;
 }
 
@@ -175,15 +186,29 @@ static void uninit(AVFilterContext *ctx)
         av_free(s->frpos);
 }
 
+static void fill_iplimage_from_frame(IplImage *img, const AVFrame *frame, enum AVPixelFormat pixfmt)
+{
+    IplImage *tmpimg;
+    int depth, channels_nb;
+
+    if      (pixfmt == AV_PIX_FMT_GRAY8) { depth = IPL_DEPTH_8U;  channels_nb = 1; }
+    else if (pixfmt == AV_PIX_FMT_BGRA)  { depth = IPL_DEPTH_8U;  channels_nb = 4; }
+    else if (pixfmt == AV_PIX_FMT_BGR24) { depth = IPL_DEPTH_8U;  channels_nb = 3; }
+    else return;
+
+    tmpimg = cvCreateImageHeader((CvSize){frame->width, frame->height}, depth, channels_nb);
+    *img = *tmpimg;
+    cvReleaseImageHeader(&tmpimg);
+    img->imageData = img->imageDataOrigin = frame->data[0];
+    img->dataOrder = IPL_DATA_ORDER_PIXEL;
+    img->origin    = IPL_ORIGIN_TL;
+    img->widthStep = frame->linesize[0];
+}
+
 static int query_formats(AVFilterContext *ctx)
 {
     static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P,  AV_PIX_FMT_YUV420P,
-        AV_PIX_FMT_YUV411P,  AV_PIX_FMT_YUV410P,
-        AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ420P,
-        AV_PIX_FMT_YUV440P,  AV_PIX_FMT_YUVJ440P,
-        AV_PIX_FMT_YUVA420P, AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUVA444P,
-        AV_PIX_FMT_NONE
+        AV_PIX_FMT_BGR24, AV_PIX_FMT_BGRA, AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE
     };
     AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
     if (!fmts_list)
@@ -216,11 +241,6 @@ static int config_input(AVFilterLink *inlink)
 
     for (i = 0; i <= NUM_EXPR_EVALS; i++) {
         /* evaluate expressions, fail on last iteration */
-        var_values[VAR_MAX] = inlink->w;
-        var_values[VAR_MAX] = inlink->h;
-        var_values[VAR_MAX] = inlink->w - s->x;
-        var_values[VAR_MAX] = inlink->h - s->y;
-
         var_values[VAR_MAX] = INT_MAX;
         if ((ret = av_expr_parse_and_eval(&res, (expr = s->w_expr),
                                           var_names, var_values,
@@ -233,22 +253,7 @@ static int config_input(AVFilterLink *inlink)
                 NULL, NULL, NULL, NULL, NULL, 0, ctx)) < 0 && i == NUM_EXPR_EVALS)
             goto fail;
         s->thresh = var_values[VAR_T] = res;
-
     }
-
-    /* if w or h are zero, use the input w/h */
-    s->w = (s->w > 0) ? s->w : inlink->w;
-    s->h = (s->h > 0) ? s->h : inlink->h;
-
-    /* sanity check width and height */
-    if (s->w <  0 || s->h <  0) {
-        av_log(ctx, AV_LOG_ERROR, "Size values less than 0 are not acceptable.\n");
-        return AVERROR(EINVAL);
-    }
-
-    av_log(ctx, AV_LOG_VERBOSE, "x:%d y:%d w:%d h:%d color:0x%02X%02X%02X%02X\n",
-           s->x, s->y, s->w, s->h,
-           s->yuv_color[Y], s->yuv_color[U], s->yuv_color[V], s->yuv_color[A]);
 
     return 0;
 
@@ -259,80 +264,26 @@ fail:
     return ret;
 }
 
-static void draw_rect(DrawBBoxContext *s, AVFrame *frame)
-{
-    int plane, x, y, xb = s->x, yb = s->y;
-    unsigned char *row[4];
-
-    if (s->have_alpha) {
-        for (y = FFMAX(yb, 0); y < frame->height && y < (yb + s->h); y++) {
-            row[0] = frame->data[0] + y * frame->linesize[0];
-            row[3] = frame->data[3] + y * frame->linesize[3];
-
-            for (plane = 1; plane < 3; plane++)
-                row[plane] = frame->data[plane] +
-                frame->linesize[plane] * (y >> s->vsub);
-
-            if (s->invert_color) {
-                for (x = FFMAX(xb, 0); x < xb + s->w && x < frame->width; x++)
-                    if ((y - yb < s->thickness) || (yb + s->h - 1 - y < s->thickness) ||
-                            (x - xb < s->thickness) || (xb + s->w - 1 - x < s->thickness))
-                        row[0][x] = 0xff - row[0][x];
-            } else {
-                for (x = FFMAX(xb, 0); x < xb + s->w && x < frame->width; x++) {
-                    if ((y - yb < s->thickness) || (yb + s->h - 1 - y < s->thickness) ||
-                            (x - xb < s->thickness) || (xb + s->w - 1 - x < s->thickness)) {
-                        row[0][x           ] = s->yuv_color[Y];
-                        row[1][x >> s->hsub] = s->yuv_color[U];
-                        row[2][x >> s->hsub] = s->yuv_color[V];
-                        row[3][x           ] = s->yuv_color[A];
-                    }
-                }
-            }
-        }
-    } else {
-        for (y = FFMAX(yb, 0); y < frame->height && y < (yb + s->h); y++) {
-            row[0] = frame->data[0] + y * frame->linesize[0];
-
-            for (plane = 1; plane < 3; plane++)
-                row[plane] = frame->data[plane] +
-                frame->linesize[plane] * (y >> s->vsub);
-
-            if (s->invert_color) {
-                for (x = FFMAX(xb, 0); x < xb + s->w && x < frame->width; x++)
-                    if ((y - yb < s->thickness) || (yb + s->h - 1 - y < s->thickness) ||
-                            (x - xb < s->thickness) || (xb + s->w - 1 - x < s->thickness))
-                        row[0][x] = 0xff - row[0][x];
-            } else {
-                for (x = FFMAX(xb, 0); x < xb + s->w && x < frame->width; x++) {
-                    double alpha = (double)s->yuv_color[A] / 255;
-
-                    if ((y - yb < s->thickness) || (yb + s->h - 1 - y < s->thickness) ||
-                            (x - xb < s->thickness) || (xb + s->w - 1 - x < s->thickness)) {
-                        row[0][x                 ] = (1 - alpha) * row[0][x                 ] + alpha * s->yuv_color[Y];
-                        row[1][x >> s->hsub] = (1 - alpha) * row[1][x >> s->hsub] + alpha * s->yuv_color[U];
-                        row[2][x >> s->hsub] = (1 - alpha) * row[2][x >> s->hsub] + alpha * s->yuv_color[V];
-                    }
-                }
-            }
-        }
-    }
-}
-
 static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 {
     DrawBBoxContext *s = inlink->dst->priv;
     int frame_number = frame->pts * inlink->frame_rate.num / inlink->time_base.den + 1; // odhad, ale zdase, ze funguje
     char line[256];
     int lastfr;
+    AVFrame *out;
+    AVFilterLink *outlink= inlink->dst->outputs[0];
+    IplImage inimg;
 
     if (s->frpos[frame_number - 1] < 0)
         return ff_filter_frame(inlink->dst->outputs[0], frame);
 
     fseek(s->afile, s->frpos[frame_number - 1], SEEK_SET);
 
+    fill_iplimage_from_frame(&inimg , frame , inlink->format);
+
     lastfr = frame_number;
     while (fgets(line, sizeof(line), s->afile)) {
+        char text[32];
         float currfr, prob, xmin, ymin, xmax, ymax;
         int filled = 0;
         char *lptr = line;
@@ -357,14 +308,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
         lptr += filled;
         sscanf(lptr, "%f %n", &ymax, &filled);
 
-        s->x = (int) xmin;
-        s->y = (int) ymin;
-        s->w = (int) (xmax - xmin);
-        s->h = (int) (ymax - ymin);
-        draw_rect(s, frame);
+        //TODO: proc proboha ty body nesedi o dvojnasobek, kdyz putText funguje spravne...
+        cvRectangle(&inimg, cvPoint(xmin*2, ymin*2), cvPoint(xmax*2, ymax*2), cvScalar(0, 255, 0, 0), 1, 8, 1);
+        sprintf(text, "%f", prob);
+        cvPutText(&inimg, text, cvPoint(xmin, ymin - 3), &font, cvScalar(0, 255, 0, 0));
     }
 
-    return ff_filter_frame(inlink->dst->outputs[0], frame);
+    return ff_filter_frame(outlink, frame);
 }
 
 #define OFFSET(x) offsetof(DrawBBoxContext, x)
