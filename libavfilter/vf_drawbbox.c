@@ -82,6 +82,7 @@ typedef struct DrawBBoxContext {
     char *w_expr;          ///< expression for line width
     char *filename;
     FILE *afile;
+    int offset;
     int *frpos;
     int have_alpha;
 } DrawBBoxContext;
@@ -113,7 +114,7 @@ static av_cold int init(AVFilterContext *ctx)
     }
 
     if (!s->filename) {
-        av_log(ctx, AV_LOG_ERROR, "File must be set.\n");
+        av_log(ctx, AV_LOG_ERROR, "Filename must be set.\n");
         return AVERROR(EINVAL);
     }
 
@@ -158,6 +159,7 @@ static av_cold int init(AVFilterContext *ctx)
 
             sscanf(line, "%f", &currfr);
             fr = (int) currfr - 1;
+            fr += s->offset;
             if (fr >= nof) {
                 printf("xxx");
                 break;
@@ -270,7 +272,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     int frame_number = frame->pts * inlink->frame_rate.num / inlink->time_base.den + 1; // odhad, ale zdase, ze funguje
     char line[256];
     int lastfr;
-    AVFrame *out;
     AVFilterLink *outlink= inlink->dst->outputs[0];
     IplImage inimg;
 
@@ -290,6 +291,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 
         sscanf(lptr, "%f %n", &currfr, &filled);
         lptr += filled;
+
+        currfr += s->offset;
+        if (currfr < 0)
+            currfr = 0;
+
         if ((int) currfr != lastfr) {
             lastfr = currfr;
             break;
@@ -329,8 +335,10 @@ static const AVOption drawbbox_options[] = {
     { "c",         "set color of the box",                         OFFSET(color_str), AV_OPT_TYPE_STRING, { .str = "black" }, CHAR_MIN, CHAR_MAX, FLAGS },
     { "width",     "set the line width",                           OFFSET(w_expr),    AV_OPT_TYPE_STRING, { .str="3" },       CHAR_MIN, CHAR_MAX, FLAGS },
     { "w",         "set the line width",                           OFFSET(w_expr),    AV_OPT_TYPE_STRING, { .str="3" },       CHAR_MIN, CHAR_MAX, FLAGS },
-    { "filename",  "file with bboxes",                             OFFSET(filename),  AV_OPT_TYPE_STRING, { .str="" },        CHAR_MIN, CHAR_MAX, FLAGS },
+    { "filename",  "file with bboxes",                             OFFSET(filename),  AV_OPT_TYPE_STRING, { .str=NULL },      CHAR_MIN, CHAR_MAX, FLAGS },
     { "f",         "file with bboxes",                             OFFSET(filename),  AV_OPT_TYPE_STRING, { .str=NULL },      CHAR_MIN, CHAR_MAX, FLAGS },
+    { "offset",    "frame offset",                                 OFFSET(offset),    AV_OPT_TYPE_INT,    { .i64=0 },         INT_MIN, INT_MAX, FLAGS },
+    { "o",         "frame offset",                                 OFFSET(offset),    AV_OPT_TYPE_INT,    { .i64=0 },         INT_MIN, INT_MAX, FLAGS },
     { NULL }
 };
 
