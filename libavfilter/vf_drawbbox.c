@@ -165,7 +165,7 @@ static av_cold int init(AVFilterContext *ctx)
                 break;
             }
 
-            if (last != fr) {
+            if (last != fr && fr >= 0) {
                 s->frpos[fr] = pos;
             }
 
