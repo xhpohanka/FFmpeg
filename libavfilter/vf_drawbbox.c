@@ -315,9 +315,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
         sscanf(lptr, "%f %n", &ymax, &filled);
 
         //TODO: proc proboha ty body nesedi o dvojnasobek, kdyz putText funguje spravne...
-        cvRectangle(&inimg, cvPoint(xmin*2, ymin*2), cvPoint(xmax*2, ymax*2), cvScalar(0, 255, 0, 0), 1, 8, 1);
+        cvRectangle(&inimg, cvPoint(xmin*2, ymin*2), cvPoint(xmax*2, ymax*2), cvScalar(0, 255, 0, 255), 1, 8, 1);
         sprintf(text, "%f", prob);
-        cvPutText(&inimg, text, cvPoint(xmin, ymin - 3), &font, cvScalar(0, 255, 0, 0));
+        cvPutText(&inimg, text, cvPoint(xmin, ymin - 3), &font, cvScalar(0, 255, 0, 255));
     }
 
     return ff_filter_frame(outlink, frame);
