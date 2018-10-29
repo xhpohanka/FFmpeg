@@ -28,6 +28,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 #include "libavutil/channel_layout.h"
+#include "libavutil/imgutils.h"
 #include "libavutil/internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
@@ -36,22 +37,25 @@
 #include "framequeue.h"
 
 #include "avfilter.h"
+#include "buffersink.h"
 #include "formats.h"
 #include "internal.h"
 #include "thread.h"
 
 #define OFFSET(x) offsetof(AVFilterGraph, x)
-#define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
+#define F AV_OPT_FLAG_FILTERING_PARAM
+#define V AV_OPT_FLAG_VIDEO_PARAM
+#define A AV_OPT_FLAG_AUDIO_PARAM
 static const AVOption filtergraph_options[] = {
     { "thread_type", "Allowed thread types", OFFSET(thread_type), AV_OPT_TYPE_FLAGS,
-        { .i64 = AVFILTER_THREAD_SLICE }, 0, INT_MAX, FLAGS, "thread_type" },
-        { "slice", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVFILTER_THREAD_SLICE }, .flags = FLAGS, .unit = "thread_type" },
+        { .i64 = AVFILTER_THREAD_SLICE }, 0, INT_MAX, F|V|A, "thread_type" },
+        { "slice", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVFILTER_THREAD_SLICE }, .flags = F|V|A, .unit = "thread_type" },
     { "threads",     "Maximum number of threads", OFFSET(nb_threads),
-        AV_OPT_TYPE_INT,   { .i64 = 0 }, 0, INT_MAX, FLAGS },
+        AV_OPT_TYPE_INT,   { .i64 = 0 }, 0, INT_MAX, F|V|A },
     {"scale_sws_opts"       , "default scale filter options"        , OFFSET(scale_sws_opts)        ,
-        AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
+        AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, F|V },
     {"aresample_swr_opts"   , "default aresample filter options"    , OFFSET(aresample_swr_opts)    ,
-        AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
+        AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, F|A },
     { NULL },
 };
 
@@ -127,28 +131,13 @@ void avfilter_graph_free(AVFilterGraph **graph)
 
     av_freep(&(*graph)->scale_sws_opts);
     av_freep(&(*graph)->aresample_swr_opts);
+#if FF_API_LAVR_OPTS
     av_freep(&(*graph)->resample_lavr_opts);
+#endif
     av_freep(&(*graph)->filters);
     av_freep(&(*graph)->internal);
     av_freep(graph);
 }
-
-#if FF_API_AVFILTER_OPEN
-int avfilter_graph_add_filter(AVFilterGraph *graph, AVFilterContext *filter)
-{
-    AVFilterContext **filters = av_realloc(graph->filters,
-                                           sizeof(*filters) * (graph->nb_filters + 1));
-    if (!filters)
-        return AVERROR(ENOMEM);
-
-    graph->filters = filters;
-    graph->filters[graph->nb_filters++] = filter;
-
-    filter->graph = graph;
-
-    return 0;
-}
-#endif
 
 int avfilter_graph_create_filter(AVFilterContext **filt_ctx, const AVFilter *filt,
                                  const char *name, const char *args, void *opaque,
@@ -190,7 +179,7 @@ AVFilterContext *avfilter_graph_alloc_filter(AVFilterGraph *graph,
         } else {
             int ret = ff_graph_thread_init(graph);
             if (ret < 0) {
-                av_log(graph, AV_LOG_ERROR, "Error initializing threading.\n");
+                av_log(graph, AV_LOG_ERROR, "Error initializing threading: %s.\n", av_err2str(ret));
                 return NULL;
             }
         }
@@ -274,6 +263,27 @@ static int graph_config_links(AVFilterGraph *graph, AVClass *log_ctx)
         }
     }
 
+    return 0;
+}
+
+static int graph_check_links(AVFilterGraph *graph, AVClass *log_ctx)
+{
+    AVFilterContext *f;
+    AVFilterLink *l;
+    unsigned i, j;
+    int ret;
+
+    for (i = 0; i < graph->nb_filters; i++) {
+        f = graph->filters[i];
+        for (j = 0; j < f->nb_outputs; j++) {
+            l = f->outputs[j];
+            if (l->type == AVMEDIA_TYPE_VIDEO) {
+                ret = av_image_check_size2(l->w, l->h, INT64_MAX, l->format, 0, f);
+                if (ret < 0)
+                    return ret;
+            }
+        }
+    }
     return 0;
 }
 
@@ -506,9 +516,8 @@ static int query_formats(AVFilterGraph *graph, AVClass *log_ctx)
 
             if (convert_needed) {
                 AVFilterContext *convert;
-                AVFilter *filter;
+                const AVFilter *filter;
                 AVFilterLink *inlink, *outlink;
-                char scale_args[256];
                 char inst_name[30];
 
                 if (graph->disable_auto_convert) {
@@ -528,7 +537,7 @@ static int query_formats(AVFilterGraph *graph, AVClass *log_ctx)
                         return AVERROR(EINVAL);
                     }
 
-                    snprintf(inst_name, sizeof(inst_name), "auto-inserted scaler %d",
+                    snprintf(inst_name, sizeof(inst_name), "auto_scaler_%d",
                              scaler_count++);
 
                     if ((ret = avfilter_graph_create_filter(&convert, filter,
@@ -543,12 +552,8 @@ static int query_formats(AVFilterGraph *graph, AVClass *log_ctx)
                         return AVERROR(EINVAL);
                     }
 
-                    snprintf(inst_name, sizeof(inst_name), "auto-inserted resampler %d",
+                    snprintf(inst_name, sizeof(inst_name), "auto_resampler_%d",
                              resampler_count++);
-                    scale_args[0] = '\0';
-                    if (graph->aresample_swr_opts)
-                        snprintf(scale_args, sizeof(scale_args), "%s",
-                                 graph->aresample_swr_opts);
                     if ((ret = avfilter_graph_create_filter(&convert, filter,
                                                             inst_name, graph->aresample_swr_opts,
                                                             NULL, graph)) < 0)
@@ -674,6 +679,7 @@ static int pick_format(AVFilterLink *link, AVFilterLink *ref)
 
     if (link->type == AVMEDIA_TYPE_VIDEO) {
         if(ref && ref->type == AVMEDIA_TYPE_VIDEO){
+            //FIXME: This should check for AV_PIX_FMT_FLAG_ALPHA after PAL8 pixel format without alpha is implemented
             int has_alpha= av_pix_fmt_desc_get(ref->format)->nb_components % 2 == 0;
             enum AVPixelFormat best= AV_PIX_FMT_NONE;
             int i;
@@ -874,6 +880,8 @@ static void swap_samplerates_on_filter(AVFilterContext *filter)
 
         for (j = 0; j < outlink->in_samplerates->nb_formats; j++) {
             int diff = abs(sample_rate - outlink->in_samplerates->formats[j]);
+
+            av_assert0(diff < INT_MAX); // This would lead to the use of uninitialized best_diff but is only possible with invalid sample rates
 
             if (diff < best_diff) {
                 best_diff = diff;
@@ -1230,7 +1238,7 @@ static int graph_insert_fifos(AVFilterGraph *graph, AVClass *log_ctx)
         for (j = 0; j < f->nb_inputs; j++) {
             AVFilterLink *link = f->inputs[j];
             AVFilterContext *fifo_ctx;
-            AVFilter *fifo;
+            const AVFilter *fifo;
             char name[32];
 
             if (!link->dstpad->needs_fifo)
@@ -1240,7 +1248,7 @@ static int graph_insert_fifos(AVFilterGraph *graph, AVClass *log_ctx)
                    avfilter_get_by_name("fifo") :
                    avfilter_get_by_name("afifo");
 
-            snprintf(name, sizeof(name), "auto-inserted fifo %d", fifo_count++);
+            snprintf(name, sizeof(name), "auto_fifo_%d", fifo_count++);
 
             ret = avfilter_graph_create_filter(&fifo_ctx, fifo, name, NULL,
                                                NULL, graph);
@@ -1267,6 +1275,8 @@ int avfilter_graph_config(AVFilterGraph *graphctx, void *log_ctx)
     if ((ret = graph_config_formats(graphctx, log_ctx)))
         return ret;
     if ((ret = graph_config_links(graphctx, log_ctx)))
+        return ret;
+    if ((ret = graph_check_links(graphctx, log_ctx)))
         return ret;
     if ((ret = graph_config_pointers(graphctx, log_ctx)))
         return ret;
@@ -1319,6 +1329,9 @@ int avfilter_graph_queue_command(AVFilterGraph *graph, const char *target, const
                 queue = &(*queue)->next;
             next = *queue;
             *queue = av_mallocz(sizeof(AVFilterCommand));
+            if (!*queue)
+                return AVERROR(ENOMEM);
+
             (*queue)->command = av_strdup(command);
             (*queue)->arg     = av_strdup(arg);
             (*queue)->time    = ts;
@@ -1389,7 +1402,15 @@ int avfilter_graph_request_oldest(AVFilterGraph *graph)
 
     while (graph->sink_links_count) {
         oldest = graph->sink_links[0];
-        r = ff_request_frame(oldest);
+        if (oldest->dst->filter->activate) {
+            /* For now, buffersink is the only filter implementing activate. */
+            r = av_buffersink_get_frame_flags(oldest->dst, NULL,
+                                              AV_BUFFERSINK_FLAG_PEEK);
+            if (r != AVERROR_EOF)
+                return r;
+        } else {
+            r = ff_request_frame(oldest);
+        }
         if (r != AVERROR_EOF)
             break;
         av_log(oldest->dst, AV_LOG_DEBUG, "EOF on sink link %s:%s.\n",
@@ -1403,11 +1424,16 @@ int avfilter_graph_request_oldest(AVFilterGraph *graph)
     }
     if (!graph->sink_links_count)
         return AVERROR_EOF;
+    av_assert1(!oldest->dst->filter->activate);
     av_assert1(oldest->age_index >= 0);
     frame_count = oldest->frame_count_out;
     while (frame_count == oldest->frame_count_out) {
         r = ff_filter_graph_run_once(graph);
-        if (r < 0)
+        if (r == AVERROR(EAGAIN) &&
+            !oldest->frame_wanted_out && !oldest->frame_blocked_in &&
+            !oldest->status_in)
+            ff_request_frame(oldest);
+        else if (r < 0)
             return r;
     }
     return 0;

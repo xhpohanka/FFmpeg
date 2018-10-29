@@ -34,6 +34,8 @@
 #include "internal.h"
 #include "img2.h"
 #include "libavcodec/mjpeg.h"
+#include "libavcodec/xwd.h"
+#include "subtitles.h"
 
 #if HAVE_GLOB
 /* Locally define as 0 (bitwise-OR no-op) any missing glob options that
@@ -197,7 +199,7 @@ int ff_img_read_header(AVFormatContext *s1)
         return AVERROR(EINVAL);
     }
 
-    av_strlcpy(s->path, s1->filename, sizeof(s->path));
+    av_strlcpy(s->path, s1->url, sizeof(s->path));
     s->img_number = 0;
     s->img_count  = 0;
 
@@ -322,7 +324,8 @@ int ff_img_read_header(AVFormatContext *s1)
         if (s1->pb) {
             int probe_buffer_size = 2048;
             uint8_t *probe_buffer = av_realloc(NULL, probe_buffer_size + AVPROBE_PADDING_SIZE);
-            AVInputFormat *fmt = NULL;
+            const AVInputFormat *fmt = NULL;
+            void *fmt_iter = NULL;
             AVProbeData pd = { 0 };
 
             if (!probe_buffer)
@@ -337,9 +340,9 @@ int ff_img_read_header(AVFormatContext *s1)
 
             pd.buf = probe_buffer;
             pd.buf_size = probe_buffer_size;
-            pd.filename = s1->filename;
+            pd.filename = s1->url;
 
-            while ((fmt = av_iformat_next(fmt))) {
+            while ((fmt = av_demuxer_iterate(&fmt_iter))) {
                 if (fmt->read_header != ff_img_read_header ||
                     !fmt->read_probe ||
                     (fmt->flags & AVFMT_NOFILE) ||
@@ -755,6 +758,8 @@ static int jpeg_probe(AVProbeData *p)
 
     if (state == EOI)
         return AVPROBE_SCORE_EXTENSION + 1;
+    if (state == SOS)
+        return AVPROBE_SCORE_EXTENSION / 2;
     return AVPROBE_SCORE_EXTENSION / 8;
 }
 
@@ -847,10 +852,7 @@ static int psd_probe(AVProbeData *p)
     if ((color_mode <= 9) && (color_mode != 5) && (color_mode != 6))
         ret += 1;
 
-    if (ret)
-        return AVPROBE_SCORE_EXTENSION + ret;
-
-    return 0;
+    return AVPROBE_SCORE_EXTENSION + ret;
 }
 
 static int sgi_probe(AVProbeData *p)
@@ -871,6 +873,26 @@ static int sunrast_probe(AVProbeData *p)
 
     if (AV_RB32(b) == 0x59a66a95)
         return AVPROBE_SCORE_EXTENSION + 1;
+    return 0;
+}
+
+static int svg_probe(AVProbeData *p)
+{
+    const uint8_t *b = p->buf;
+    const uint8_t *end = p->buf + p->buf_size;
+
+    if (memcmp(p->buf, "<?xml", 5))
+        return 0;
+    while (b < end) {
+        int inc = ff_subtitles_next_line(b);
+        if (!inc)
+            break;
+        b += inc;
+        if (b >= end - 4)
+            return 0;
+        if (!memcmp(b, "<svg", 4))
+            return AVPROBE_SCORE_EXTENSION + 1;
+    }
     return 0;
 }
 
@@ -944,6 +966,45 @@ static int pam_probe(AVProbeData *p)
     return pnm_magic_check(p, 7) ? pnm_probe(p) : 0;
 }
 
+static int xpm_probe(AVProbeData *p)
+{
+    const uint8_t *b = p->buf;
+
+    if (AV_RB64(b) == 0x2f2a2058504d202a && *(b+8) == '/')
+        return AVPROBE_SCORE_MAX - 1;
+    return 0;
+}
+
+static int xwd_probe(AVProbeData *p)
+{
+    const uint8_t *b = p->buf;
+    unsigned width, bpp, bpad, lsize;
+
+    if (   p->buf_size < XWD_HEADER_SIZE
+        || AV_RB32(b     ) < XWD_HEADER_SIZE                          // header size
+        || AV_RB32(b +  4) != XWD_VERSION                             // version
+        || AV_RB32(b +  8) != XWD_Z_PIXMAP                            // format
+        || AV_RB32(b + 12) > 32 || !AV_RB32(b + 12)                   // depth
+        || AV_RB32(b + 16) == 0                                       // width
+        || AV_RB32(b + 20) == 0                                       // height
+        || AV_RB32(b + 28) > 1                                        // byteorder
+        || AV_RB32(b + 32) & ~56 || av_popcount(AV_RB32(b + 32)) != 1 // bitmap unit
+        || AV_RB32(b + 36) > 1                                        // bitorder
+        || AV_RB32(b + 40) & ~56 || av_popcount(AV_RB32(b + 40)) != 1 // padding
+        || AV_RB32(b + 44) > 32 || !AV_RB32(b + 44)                   // bpp
+        || AV_RB32(b + 68) > 256)                                     // colours
+        return 0;
+
+    width = AV_RB32(b + 16);
+    bpad  = AV_RB32(b + 40);
+    bpp   = AV_RB32(b + 44);
+    lsize = AV_RB32(b + 48);
+    if (lsize < FFALIGN(width * bpp, bpad) >> 3)
+        return 0;
+
+    return AVPROBE_SCORE_MAX / 2 + 1;
+}
+
 #define IMAGEAUTO_DEMUXER(imgname, codecid)\
 static const AVClass imgname ## _class = {\
     .class_name = AV_STRINGIFY(imgname) " demuxer",\
@@ -982,5 +1043,8 @@ IMAGEAUTO_DEMUXER(psd,     AV_CODEC_ID_PSD)
 IMAGEAUTO_DEMUXER(qdraw,   AV_CODEC_ID_QDRAW)
 IMAGEAUTO_DEMUXER(sgi,     AV_CODEC_ID_SGI)
 IMAGEAUTO_DEMUXER(sunrast, AV_CODEC_ID_SUNRAST)
+IMAGEAUTO_DEMUXER(svg,     AV_CODEC_ID_SVG)
 IMAGEAUTO_DEMUXER(tiff,    AV_CODEC_ID_TIFF)
 IMAGEAUTO_DEMUXER(webp,    AV_CODEC_ID_WEBP)
+IMAGEAUTO_DEMUXER(xpm,     AV_CODEC_ID_XPM)
+IMAGEAUTO_DEMUXER(xwd,     AV_CODEC_ID_XWD)

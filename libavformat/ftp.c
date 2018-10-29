@@ -206,6 +206,9 @@ static int ftp_send_command(FTPContext *s, const char *command,
     if (response)
         *response = NULL;
 
+    if (!s->conn_control)
+        return AVERROR(EIO);
+
     if ((err = ffurl_write(s->conn_control, command, strlen(command))) < 0)
         return err;
     if (!err)
@@ -485,8 +488,6 @@ static int ftp_list_nlst(FTPContext *s)
     s->listing_method = NLST;
     return 0;
 }
-
-static int ftp_has_feature(FTPContext *s, const char *feature_name);
 
 static int ftp_list(FTPContext *s)
 {
