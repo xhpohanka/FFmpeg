@@ -3381,6 +3381,7 @@ delogo_filter_deps="gpl"
 denoise_vaapi_filter_deps="vaapi"
 deshake_filter_select="pixelutils"
 dilation_opencl_filter_deps="opencl"
+drawbbox_filter_deps="libopencv"
 drawtext_filter_deps="libfreetype"
 drawtext_filter_suggest="libfontconfig libfribidi"
 elbg_filter_deps="avcodec"
@@ -6103,6 +6104,10 @@ enabled libnpp            && { check_lib libnpp npp.h nppGetLibVersion -lnppig -
 enabled libopencore_amrnb && require libopencore_amrnb opencore-amrnb/interf_dec.h Decoder_Interface_init -lopencore-amrnb
 enabled libopencore_amrwb && require libopencore_amrwb opencore-amrwb/dec_if.h D_IF_init -lopencore-amrwb
 enabled libopencv         && { check_headers opencv2/core/core_c.h &&
+                               { check_pkg_config libopencv opencv opencv2/core/core_c.h cvCreateImageHeader ||
+                                 require libopencv opencv2/core/core_c.h cvCreateImageHeader -lopencv_core -lopencv_imgproc; } ||
+                               require_pkg_config libopencv opencv opencv/cxcore.h cvCreateImageHeader; }
+enabled drawbbox         && { check_headers opencv2/core/core_c.h &&
                                { check_pkg_config libopencv opencv opencv2/core/core_c.h cvCreateImageHeader ||
                                  require libopencv opencv2/core/core_c.h cvCreateImageHeader -lopencv_core -lopencv_imgproc; } ||
                                require_pkg_config libopencv opencv opencv/cxcore.h cvCreateImageHeader; }
